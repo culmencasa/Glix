@@ -1,5 +1,7 @@
 using System;
+using System.Threading;
 using System.Windows.Forms;
+using Microsoft.Win32;
 
 namespace Glix;
 
@@ -12,18 +14,19 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private readonly GestureEngine _engine;
     private readonly NavigationAction _navigation;
-    private readonly GestureOverlay _overlay;
     private readonly TrayDirectionIndicator _directionIcons = new TrayDirectionIndicator();
     private readonly Control _marshalControl = new Control();
     private readonly NotifyIcon _notifyIcon;
     private readonly ToolStripMenuItem _pauseItem;
     private readonly ToolStripMenuItem _soundItem;
-    private readonly ToolStripMenuItem _overlayItem;
     private readonly ToolStripMenuItem _soundSourceItem;
     private readonly ToolStripMenuItem _settingsItem;
     private readonly AppSettings _settings;
     private readonly GestureOptions _gestureOptions;
     private Icon? _currentTrayIcon;
+    private float _lastAngle;
+    private float _pendingAngle;
+    private bool _angleUpdatePending;
     private readonly System.Windows.Forms.Timer _sleepTimer = new System.Windows.Forms.Timer();
     private int _sleepFrame;
 
@@ -36,10 +39,7 @@ internal sealed class TrayAppContext : ApplicationContext
         // 在 UI 线程创建隐藏控件，用于把鼠标方向更新可靠地封送回 UI 线程。
         _marshalControl.CreateControl();
 
-        _overlay = new GestureOverlay();
-        _ = _overlay.Handle;
-
-        _navigation = new NavigationAction(_overlay)
+        _navigation = new NavigationAction()
         {
             SoundEnabled = true,
             SoundMode = SoundMode.Custom
@@ -57,23 +57,21 @@ internal sealed class TrayAppContext : ApplicationContext
         _engine = new GestureEngine(_gestureOptions);
         _engine.AddTrigger(new CircleGestureTrigger(_gestureOptions));
         _engine.AddAction(_navigation);
-        _engine.MouseDirectionChanged += OnMouseDirectionChanged;
+        _engine.MouseAngleChanged += OnMouseAngleChanged;
         _engine.Start();
 
         _sleepTimer.Interval = 600;
         _sleepTimer.Tick += OnSleepTick;
 
-        _currentTrayIcon = _directionIcons.CreateIcon(ScreenDirection.None);
+        _currentTrayIcon = _directionIcons.CreateIcon(0f);
 
         _pauseItem = new ToolStripMenuItem("暂停手势") { CheckOnClick = true };
         _soundItem = new ToolStripMenuItem("提示音") { CheckOnClick = true, Checked = true };
-        _overlayItem = new ToolStripMenuItem("动作提示") { CheckOnClick = true, Checked = true };
         _soundSourceItem = new ToolStripMenuItem("使用系统导航音效") { CheckOnClick = true, Checked = false };
         _settingsItem = new ToolStripMenuItem("设置...");
 
         _pauseItem.Click += OnPauseClicked;
         _soundItem.Click += OnSoundClicked;
-        _overlayItem.Click += OnOverlayClicked;
         _soundSourceItem.Click += OnSoundSourceClicked;
         _settingsItem.Click += OnSettingsClicked;
 
@@ -84,6 +82,8 @@ internal sealed class TrayAppContext : ApplicationContext
             Visible = true,
             ContextMenuStrip = BuildMenu()
         };
+
+        SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
     }
 
     #endregion
@@ -98,13 +98,13 @@ internal sealed class TrayAppContext : ApplicationContext
     {
         if (disposing)
         {
-            _engine.MouseDirectionChanged -= OnMouseDirectionChanged;
+            SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
+            _engine.MouseAngleChanged -= OnMouseAngleChanged;
             _engine.Dispose();
             _sleepTimer.Dispose();
             _currentTrayIcon?.Dispose();
             _directionIcons.Dispose();
             _marshalControl.Dispose();
-            _overlay.Dispose();
             _notifyIcon.Visible = false;
             _notifyIcon.Dispose();
         }
@@ -124,7 +124,6 @@ internal sealed class TrayAppContext : ApplicationContext
         ContextMenuStrip menu = new ContextMenuStrip();
         menu.Items.Add(_pauseItem);
         menu.Items.Add(_soundItem);
-        menu.Items.Add(_overlayItem);
         menu.Items.Add(_soundSourceItem);
         menu.Items.Add(_settingsItem);
         menu.Items.Add(new ToolStripSeparator());
@@ -133,21 +132,65 @@ internal sealed class TrayAppContext : ApplicationContext
         return menu;
     }
 
-    private void OnMouseDirectionChanged(ScreenDirection direction)
+    private void OnMouseAngleChanged(float angle)
     {
+        Volatile.Write(ref _pendingAngle, angle);
+
+        if (Volatile.Read(ref _angleUpdatePending))
+        {
+            return;
+        }
+
+        Volatile.Write(ref _angleUpdatePending, true);
+
         if (_marshalControl.IsHandleCreated)
         {
-            _marshalControl.BeginInvoke(new Action<ScreenDirection>(UpdateTrayIcon), direction);
+            _marshalControl.BeginInvoke(new Action(ApplyPendingAngle));
         }
         else
         {
-            UpdateTrayIcon(direction);
+            ApplyPendingAngle();
         }
     }
 
-    private void UpdateTrayIcon(ScreenDirection direction)
+    private void ApplyPendingAngle()
     {
-        Icon newIcon = _directionIcons.CreateIcon(direction);
+        float angle = Volatile.Read(ref _pendingAngle);
+
+        UpdateTrayIcon(angle);
+
+        Volatile.Write(ref _angleUpdatePending, false);
+    }
+
+    private void OnUserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
+    {
+        if (_marshalControl.IsHandleCreated)
+        {
+            _marshalControl.BeginInvoke(new Action(RefreshTrayIcon));
+        }
+        else
+        {
+            RefreshTrayIcon();
+        }
+    }
+
+    private void RefreshTrayIcon()
+    {
+        if (_pauseItem.Checked)
+        {
+            UpdatePauseTrayIcon();
+        }
+        else
+        {
+            UpdateTrayIcon(_lastAngle);
+        }
+    }
+
+    private void UpdateTrayIcon(float angle)
+    {
+        _lastAngle = angle;
+
+        Icon newIcon = _directionIcons.CreateIcon(angle);
         _notifyIcon.Icon = newIcon;
 
         Icon? oldIcon = _currentTrayIcon;
@@ -168,7 +211,7 @@ internal sealed class TrayAppContext : ApplicationContext
         else
         {
             _sleepTimer.Stop();
-            UpdateTrayIcon(ScreenDirection.None);
+            UpdateTrayIcon(0f);
         }
     }
 
@@ -196,11 +239,6 @@ internal sealed class TrayAppContext : ApplicationContext
     private void OnSoundSourceClicked(object? sender, EventArgs e)
     {
         _navigation.SoundMode = _soundSourceItem.Checked ? SoundMode.System : SoundMode.Custom;
-    }
-
-    private void OnOverlayClicked(object? sender, EventArgs e)
-    {
-        _navigation.OverlayEnabled = _overlayItem.Checked;
     }
 
     private void OnSettingsClicked(object? sender, EventArgs e)

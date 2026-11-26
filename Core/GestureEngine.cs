@@ -38,8 +38,10 @@ internal sealed class GestureEngine : IDisposable
     // 鼠标主方向跟踪：用于驱动托盘图标的方向箭头指示，与手势识别相互独立。
     private int _lastDirX = int.MinValue;
     private int _lastDirY = int.MinValue;
-    private ScreenDirection _currentDirection = ScreenDirection.None;
+    private int _currentAngleStep = -1;
     private const int DirectionThresholdPx = 12;
+    private const int AngleStepCount = 72;
+    private const float AngleStepDegrees = 360f / AngleStepCount;
 
     #endregion
 
@@ -100,9 +102,9 @@ internal sealed class GestureEngine : IDisposable
     #region 事件
 
     /// <summary>
-    /// 鼠标主移动方向变化时触发，用于驱动托盘图标的方向指示。
+    /// 鼠标主移动角度变化时触发，角度为从正上方顺时针计算的度数，用于驱动托盘图标的方向指示。
     /// </summary>
-    public event Action<ScreenDirection>? MouseDirectionChanged;
+    public event Action<float>? MouseAngleChanged;
 
     #endregion
 
@@ -301,21 +303,16 @@ internal sealed class GestureEngine : IDisposable
             return;
         }
 
-        ScreenDirection direction;
+        double radians = Math.Atan2(deltaY, deltaX);
+        double degrees = (radians * 180.0 / Math.PI) + 90.0;
+        float angle = (float)((degrees + 360.0) % 360.0);
 
-        if (Math.Abs(deltaX) > Math.Abs(deltaY))
-        {
-            direction = deltaX > 0 ? ScreenDirection.Right : ScreenDirection.Left;
-        }
-        else
-        {
-            direction = deltaY > 0 ? ScreenDirection.Down : ScreenDirection.Up;
-        }
+        int step = (int)Math.Round(angle / AngleStepDegrees) % AngleStepCount;
 
-        if (direction != _currentDirection)
+        if (step != _currentAngleStep)
         {
-            _currentDirection = direction;
-            MouseDirectionChanged?.Invoke(direction);
+            _currentAngleStep = step;
+            MouseAngleChanged?.Invoke(step * AngleStepDegrees);
         }
 
         _lastDirX = x;

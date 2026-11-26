@@ -2,46 +2,34 @@ using System;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
-using System.Drawing.Text;
+using System.IO;
+using System.Text;
+using Microsoft.Win32;
 
 namespace Glix;
 
 /// <summary>
-/// 生成并缓存跟随鼠标方向的托盘箭头图标（蓝底白箭头，复刻 PopMouse 观感），
-/// 以及「暂停 / 睡眠」状态的 Zzz 动画图标。图标按方向实时生成，调用方负责释放上一代图标。
+/// 生成无背景的描线风格托盘图标：方向箭头与暂停状态的 Zzz 动画。
+/// 描边颜色根据系统托盘主题自动切换，兼容深色与浅色任务栏。
 /// </summary>
 internal sealed class TrayDirectionIndicator : IDisposable
 {
-    #region 字段
+    private static readonly int[] IconSizes = { 16, 20, 24, 32, 48 };
 
     private bool _disposed;
 
-    #endregion
-
-    #region 公共方法
-
     /// <summary>
-    /// 按指定方向创建一个独立拥有的托盘图标，调用方负责 <see cref="Icon.Dispose"/>。
+    /// 按指定角度创建一个独立拥有的托盘图标，调用方负责 <see cref="Icon.Dispose"/>。
     /// </summary>
-    /// <param name="direction">目标方向。</param>
+    /// <param name="angleDegrees">箭头方向，从正上方顺时针计算的度数。</param>
     /// <returns>新建的图标实例。</returns>
-    public Icon CreateIcon(ScreenDirection direction)
+    public Icon CreateIcon(float angleDegrees)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        float angle = direction switch
-        {
-            ScreenDirection.Up => 0f,
-            ScreenDirection.Right => 90f,
-            ScreenDirection.Down => 180f,
-            ScreenDirection.Left => 270f,
-            _ => 0f
-        };
+        Color stroke = GetStrokeColor();
 
-        using (Bitmap bitmap = BuildArrowBitmap(angle))
-        {
-            return ToOwnedIcon(bitmap);
-        }
+        return BuildIcon((size, graphics) => DrawArrow(graphics, size, angleDegrees, stroke));
     }
 
     /// <summary>
@@ -54,37 +42,10 @@ internal sealed class TrayDirectionIndicator : IDisposable
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        const int size = 32;
+        Color stroke = GetStrokeColor();
+        int count = (frame % 3) + 1;
 
-        using (Bitmap bitmap = new Bitmap(size, size, PixelFormat.Format32bppArgb))
-        {
-            using (Graphics graphics = Graphics.FromImage(bitmap))
-            {
-                graphics.SmoothingMode = SmoothingMode.AntiAlias;
-                graphics.TextRenderingHint = TextRenderingHint.AntiAlias;
-                graphics.Clear(Color.Transparent);
-
-                DrawRoundedBackground(graphics, size);
-
-                int count = (frame % 3) + 1;
-
-                using (SolidBrush brush = new SolidBrush(Color.White))
-                {
-                    // 由下往上、由小变大依次叠出 z，模拟睡意飘散。
-                    for (int i = 0; i < count; i++)
-                    {
-                        float fontPx = 10f + (i * 4f);
-
-                        using (Font font = new Font("Segoe UI", fontPx, FontStyle.Bold))
-                        {
-                            graphics.DrawString("z", font, brush, 6f + (i * 6f), 18f - (i * 7f));
-                        }
-                    }
-                }
-            }
-
-            return ToOwnedIcon(bitmap);
-        }
+        return BuildIcon((size, graphics) => DrawZzz(graphics, size, count, stroke));
     }
 
     /// <inheritdoc/>
@@ -93,97 +54,145 @@ internal sealed class TrayDirectionIndicator : IDisposable
         _disposed = true;
     }
 
-    #endregion
-
-    #region 私有方法
-
-    private static Icon ToOwnedIcon(Bitmap bitmap)
+    private static Color GetStrokeColor()
     {
-        IntPtr handle = bitmap.GetHicon();
+        const string keyPath = @"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
 
-        Icon owned;
-
-        using (Icon fromHandle = Icon.FromHandle(handle))
+        using (RegistryKey? key = Registry.CurrentUser.OpenSubKey(keyPath))
         {
-            owned = (Icon)fromHandle.Clone();
+            if (key?.GetValue("SystemUsesLightTheme") is int lightTheme)
+            {
+                return lightTheme == 0 ? Color.White : Color.FromArgb(26, 26, 26);
+            }
         }
 
-        NativeMethods.DestroyIcon(handle);
-
-        return owned;
+        return Color.FromArgb(26, 26, 26);
     }
 
-    private static Bitmap BuildArrowBitmap(float angleDegrees)
+    private static Icon BuildIcon(Action<int, Graphics> draw)
     {
-        const int size = 32;
+        List<byte[]> images = new List<byte[]>(IconSizes.Length);
 
-        Bitmap bitmap = new Bitmap(size, size, PixelFormat.Format32bppArgb);
-
-        using (Graphics graphics = Graphics.FromImage(bitmap))
+        foreach (int size in IconSizes)
         {
-            graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            graphics.Clear(Color.Transparent);
-
-            DrawRoundedBackground(graphics, size);
-
-            // 白色箭头：以「向上」为基准绘制后整体旋转到目标方向。
-            graphics.TranslateTransform(size / 2f, size / 2f);
-            graphics.RotateTransform(angleDegrees);
-
-            float pad = 2f;
-            float usable = size - (pad * 2f) - 4f;
-            float headHalf = usable * 0.32f;
-            float headHeight = usable * 0.40f;
-            float barHalf = usable * 0.22f;
-            float barHeight = usable * 0.34f;
-            float top = -usable / 2f;
-
-            using (GraphicsPath arrowPath = new GraphicsPath())
+            using (Bitmap bitmap = new Bitmap(size, size, PixelFormat.Format32bppArgb))
             {
-                arrowPath.AddPolygon(new[]
+                using (Graphics graphics = Graphics.FromImage(bitmap))
                 {
-                    new PointF(0f, top),
-                    new PointF(-headHalf, top + headHeight),
-                    new PointF(headHalf, top + headHeight)
-                });
-                arrowPath.AddRectangle(new RectangleF(-barHalf, top + headHeight, barHalf * 2f, barHeight));
+                    graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                    graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                    graphics.Clear(Color.Transparent);
+                    draw(size, graphics);
+                }
 
-                using (SolidBrush brush = new SolidBrush(Color.White))
+                using (MemoryStream png = new MemoryStream())
                 {
-                    graphics.FillPath(brush, arrowPath);
+                    bitmap.Save(png, ImageFormat.Png);
+                    images.Add(png.ToArray());
                 }
             }
         }
 
-        return bitmap;
-    }
-
-    private static void DrawRoundedBackground(Graphics graphics, int size)
-    {
-        float pad = 2f;
-        float radius = 7f;
-        RectangleF backgroundRect = new RectangleF(pad, pad, size - (pad * 2f), size - (pad * 2f));
-
-        using (GraphicsPath backgroundPath = RoundedRectangle(backgroundRect, radius))
-        using (SolidBrush backgroundBrush = new SolidBrush(Color.FromArgb(45, 125, 210)))
+        using (MemoryStream iconStream = new MemoryStream())
         {
-            graphics.FillPath(backgroundBrush, backgroundPath);
+            using (BinaryWriter writer = new BinaryWriter(iconStream, Encoding.UTF8, true))
+            {
+                writer.Write((ushort)0);
+                writer.Write((ushort)1);
+                writer.Write((ushort)images.Count);
+
+                int offset = 6 + (16 * images.Count);
+
+                for (int i = 0; i < images.Count; i++)
+                {
+                    byte dimension = (byte)IconSizes[i];
+
+                    writer.Write(dimension);
+                    writer.Write(dimension);
+                    writer.Write((byte)0);
+                    writer.Write((byte)0);
+                    writer.Write((ushort)1);
+                    writer.Write((ushort)32);
+                    writer.Write((uint)images[i].Length);
+                    writer.Write((uint)offset);
+                    offset += images[i].Length;
+                }
+
+                foreach (byte[] image in images)
+                {
+                    writer.Write(image);
+                }
+            }
+
+            iconStream.Position = 0;
+
+            return new Icon(iconStream);
         }
     }
 
-    private static GraphicsPath RoundedRectangle(RectangleF rect, float radius)
+    private static void DrawArrow(Graphics graphics, int size, float angle, Color stroke)
     {
-        GraphicsPath path = new GraphicsPath();
-        float diameter = radius * 2f;
+        float radius = size * 0.44f;
+        float headHalf = radius * 0.80f;
+        float stemHalf = radius * 0.30f;
+        float headBaseY = radius * 0.32f;
 
-        path.AddArc(rect.X, rect.Y, diameter, diameter, 180f, 90f);
-        path.AddArc(rect.Right - diameter, rect.Y, diameter, diameter, 270f, 90f);
-        path.AddArc(rect.Right - diameter, rect.Bottom - diameter, diameter, diameter, 0f, 90f);
-        path.AddArc(rect.X, rect.Bottom - diameter, diameter, diameter, 90f, 90f);
-        path.CloseFigure();
+        using (GraphicsPath path = new GraphicsPath())
+        {
+            PointF[] outline =
+            {
+                new PointF(0f, -radius),
+                new PointF(headHalf, headBaseY),
+                new PointF(stemHalf, headBaseY),
+                new PointF(stemHalf, radius),
+                new PointF(-stemHalf, radius),
+                new PointF(-stemHalf, headBaseY),
+                new PointF(-headHalf, headBaseY)
+            };
+            path.AddPolygon(outline);
+            path.CloseFigure();
 
-        return path;
+            using (Pen pen = CreatePen(stroke, Math.Max(1f, size * 0.085f)))
+            {
+                graphics.TranslateTransform(size / 2f, size / 2f);
+                graphics.RotateTransform(angle);
+                graphics.DrawPath(pen, path);
+            }
+        }
     }
 
-    #endregion
+    private static void DrawZzz(Graphics graphics, int size, int count, Color stroke)
+    {
+        using (Pen pen = CreatePen(stroke, Math.Max(0.8f, size * 0.055f)))
+        {
+            for (int i = 0; i < count; i++)
+            {
+                float extent = size * (0.21f + (i * 0.03f));
+                float centerX = size * (0.19f + (i * 0.27f));
+                float centerY = size * (0.86f - (i * 0.34f));
+                float half = extent / 2f;
+
+                PointF[] z =
+                {
+                    new PointF(centerX - half, centerY - half),
+                    new PointF(centerX + half, centerY - half),
+                    new PointF(centerX - half, centerY + half),
+                    new PointF(centerX + half, centerY + half)
+                };
+                graphics.DrawLines(pen, z);
+            }
+        }
+    }
+
+    private static Pen CreatePen(Color stroke, float width)
+    {
+        Pen pen = new Pen(stroke, width)
+        {
+            LineJoin = LineJoin.Round,
+            StartCap = LineCap.Round,
+            EndCap = LineCap.Round
+        };
+
+        return pen;
+    }
 }

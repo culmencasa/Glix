@@ -35,7 +35,6 @@ internal sealed class HotZoneForm : Form
 
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
-        TopMost = true;
         StartPosition = FormStartPosition.Manual;
         BackColor = Color.Magenta;
         TransparencyKey = Color.Magenta;

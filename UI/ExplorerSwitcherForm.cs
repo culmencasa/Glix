@@ -5,6 +5,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Windows.Forms;
 
 namespace Glix;
@@ -39,12 +40,21 @@ internal sealed class ExplorerSwitcherForm : Form
 
     private readonly Font _tileFont = new Font("Segoe UI", 9f, FontStyle.Bold);
     private readonly Font _hintFont = new Font("Segoe UI", 8f);
-    private IReadOnlyList<ExplorerWindow> _windows;
+    private readonly CancellationTokenSource _loadCancellation = new CancellationTokenSource();
+    private readonly System.Windows.Forms.Timer _loadTimer = new System.Windows.Forms.Timer();
     private readonly List<SwitcherTile> _tiles = new List<SwitcherTile>();
     private readonly List<IntPtr> _thumbnails = new List<IntPtr>();
     private readonly Dictionary<IntPtr, Bitmap> _icons;
-    private readonly Bitmap _folderIcon;
     private readonly Panel _tilePanel = new Panel();
+    private IReadOnlyList<ExplorerWindow> _windows;
+    private Bitmap _folderIcon;
+    private Thread? _loadThread;
+    private Dictionary<IntPtr, Bitmap>? _pendingIcons;
+    private Bitmap? _pendingFolderIcon;
+    private IReadOnlyList<ExplorerWindow>? _pendingWindows;
+    private List<IntPtr>? _pendingThumbnails;
+    private volatile bool _loadReady;
+    private bool _disposed;
     private int _tileWidth = TileWidth;
     private int _columns = 1;
     private int _rows = 1;
@@ -63,8 +73,8 @@ internal sealed class ExplorerSwitcherForm : Form
     public ExplorerSwitcherForm(IReadOnlyList<ExplorerWindow> windows)
     {
         _windows = windows;
-        _folderIcon = GetFolderIcon();
-        _icons = ExplorerIconResolver.Resolve(windows, _folderIcon);
+        _folderIcon = CreateFallbackFolderIcon();
+        _icons = CreatePlaceholderIcons(windows, _folderIcon);
 
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.Manual;
@@ -83,10 +93,15 @@ internal sealed class ExplorerSwitcherForm : Form
 
         BuildLayout();
 
-        // 提前创建句柄并注册缩略图，使第一次显示时预览与窗口同时就绪。
+        // 先创建句柄，使首次显示无需等待外壳图标与 DWM 初始化。
         CreateControl();
         _windowHandle = Handle;
-        RegisterThumbnails();
+
+        _loadTimer.Interval = 30;
+        _loadTimer.Tick += OnLoadTimerTick;
+        _loadTimer.Start();
+
+        StartIconLoad(windows);
     }
 
     #endregion
@@ -147,17 +162,38 @@ internal sealed class ExplorerSwitcherForm : Form
             Show();
         }
 
-        NativeMethods.SetForegroundWindow(_windowHandle);
+        ForceForeground(_windowHandle);
 
         NativeMethods.SetWindowPos(Handle, NativeMethods.HWND_TOPMOST, 0, 0, 0, 0,
             NativeMethods.SWP_NOMOVE | NativeMethods.SWP_NOSIZE | NativeMethods.SWP_NOACTIVATE);
 
-        if (_thumbnails.Count != _windows.Count)
+        if (_thumbnails.Count > 0 && _thumbnails.Count != _windows.Count)
         {
             RegisterThumbnails();
         }
 
         UpdateThumbnailProperties();
+    }
+
+    /// <summary>
+    /// 将选中项移动到下一个卡片，循环回绕。供 Ctrl+Tab 导航使用。
+    /// </summary>
+    public void MoveNext()
+    {
+        SelectTile(_selectedIndex + 1);
+    }
+
+    /// <summary>
+    /// 激活当前选中项对应的资源管理器窗口并关闭切换器。供松开 Ctrl 时提交使用。
+    /// </summary>
+    public void ActivateSelected()
+    {
+        if (_selectedIndex < 0 || _selectedIndex >= _windows.Count)
+        {
+            return;
+        }
+
+        ActivateWindow(_windows[_selectedIndex].Handle);
     }
 
     /// <summary>
@@ -185,11 +221,18 @@ internal sealed class ExplorerSwitcherForm : Form
     /// </summary>
     public void HideAll()
     {
+        HideAll(true);
+    }
+
+    private void HideAll(bool restoreForeground)
+    {
         Hide();
-        if (_previousForeground != IntPtr.Zero && NativeMethods.IsWindow(_previousForeground))
+
+        if (restoreForeground && _previousForeground != IntPtr.Zero && NativeMethods.IsWindow(_previousForeground))
         {
             NativeMethods.SetForegroundWindow(_previousForeground);
         }
+
         Hidden?.Invoke();
     }
 
@@ -377,6 +420,214 @@ internal sealed class ExplorerSwitcherForm : Form
         return new Region(path);
     }
 
+    private static Dictionary<IntPtr, Bitmap> CreatePlaceholderIcons(IReadOnlyList<ExplorerWindow> windows, Bitmap fallback)
+    {
+        Dictionary<IntPtr, Bitmap> icons = new Dictionary<IntPtr, Bitmap>();
+
+        foreach (ExplorerWindow window in windows)
+        {
+            icons[window.Handle] = new Bitmap(fallback);
+        }
+
+        return icons;
+    }
+
+    private void StartIconLoad(IReadOnlyList<ExplorerWindow> windows)
+    {
+        _loadThread = new Thread(() => LoadIcons(windows))
+        {
+            IsBackground = true,
+            Name = "Glix.SwitcherIconLoad"
+        };
+        _loadThread.SetApartmentState(ApartmentState.STA);
+        _loadThread.Start();
+    }
+
+    private void LoadIcons(IReadOnlyList<ExplorerWindow> windows)
+    {
+        Bitmap? folderIcon = null;
+        Dictionary<IntPtr, Bitmap>? icons = null;
+        List<IntPtr>? thumbnails = null;
+
+        try
+        {
+            if (_loadCancellation.IsCancellationRequested)
+            {
+                return;
+            }
+
+            folderIcon = GetFolderIcon();
+
+            if (_loadCancellation.IsCancellationRequested)
+            {
+                return;
+            }
+
+            icons = ExplorerIconResolver.Resolve(windows, folderIcon);
+
+            if (_loadCancellation.IsCancellationRequested)
+            {
+                return;
+            }
+
+            thumbnails = RegisterThumbnailHandles(_windowHandle, windows);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            // 外壳图标或缩略图注册失败时沿用占位内容，切换器仍可正常显示。
+        }
+
+        if (_loadCancellation.IsCancellationRequested)
+        {
+            DisposeIconSet(folderIcon, icons);
+            ReleaseThumbnails(thumbnails);
+
+            return;
+        }
+
+        _pendingFolderIcon = folderIcon;
+        _pendingIcons = icons;
+        _pendingWindows = windows;
+        _pendingThumbnails = thumbnails;
+        _loadReady = true;
+    }
+
+    private static List<IntPtr> RegisterThumbnailHandles(IntPtr destination, IReadOnlyList<ExplorerWindow> windows)
+    {
+        List<IntPtr> thumbnails = new List<IntPtr>();
+
+        foreach (ExplorerWindow window in windows)
+        {
+            IntPtr thumbnail = IntPtr.Zero;
+
+            if (NativeMethods.IsWindow(window.Handle) &&
+                NativeMethods.DwmRegisterThumbnail(destination, window.Handle, out thumbnail) == 0)
+            {
+                thumbnails.Add(thumbnail);
+            }
+            else
+            {
+                thumbnails.Add(IntPtr.Zero);
+            }
+        }
+
+        return thumbnails;
+    }
+
+    private static void ReleaseThumbnails(List<IntPtr>? thumbnails)
+    {
+        if (thumbnails is null)
+        {
+            return;
+        }
+
+        foreach (IntPtr thumbnail in thumbnails)
+        {
+            if (thumbnail != IntPtr.Zero)
+            {
+                NativeMethods.DwmUnregisterThumbnail(thumbnail);
+            }
+        }
+
+        thumbnails.Clear();
+    }
+
+    private void OnLoadTimerTick(object? sender, EventArgs e)
+    {
+        if (!_loadReady)
+        {
+            return;
+        }
+
+        _loadReady = false;
+        _loadTimer.Stop();
+
+        Bitmap? folderIcon = _pendingFolderIcon;
+        Dictionary<IntPtr, Bitmap>? icons = _pendingIcons;
+        IReadOnlyList<ExplorerWindow>? windows = _pendingWindows;
+
+        _pendingFolderIcon = null;
+        _pendingIcons = null;
+        _pendingWindows = null;
+
+        ApplyLoadedIcons(folderIcon, icons, windows);
+    }
+
+    private void ApplyLoadedIcons(Bitmap? folderIcon, Dictionary<IntPtr, Bitmap>? icons, IReadOnlyList<ExplorerWindow>? windows)
+    {
+        List<IntPtr>? thumbnails = _pendingThumbnails;
+        _pendingThumbnails = null;
+
+        if (folderIcon is null || icons is null || !ReferenceEquals(_windows, windows))
+        {
+            DisposeIconSet(folderIcon, icons);
+            ReleaseThumbnails(thumbnails);
+
+            return;
+        }
+
+        _folderIcon.Dispose();
+        _folderIcon = folderIcon;
+
+        foreach (Bitmap icon in _icons.Values)
+        {
+            icon.Dispose();
+        }
+
+        _icons.Clear();
+
+        foreach (KeyValuePair<IntPtr, Bitmap> pair in icons)
+        {
+            _icons[pair.Key] = pair.Value;
+        }
+
+        foreach (SwitcherTile tile in _tiles)
+        {
+            tile.Invalidate();
+        }
+
+        UnregisterThumbnails();
+
+        if (thumbnails is not null)
+        {
+            _thumbnails.AddRange(thumbnails);
+        }
+
+        UpdateThumbnailProperties();
+    }
+
+    private static void DisposeIconSet(Bitmap? folderIcon, Dictionary<IntPtr, Bitmap>? icons)
+    {
+        folderIcon?.Dispose();
+
+        if (icons is null)
+        {
+            return;
+        }
+
+        foreach (Bitmap icon in icons.Values)
+        {
+            icon.Dispose();
+        }
+
+        icons.Clear();
+    }
+
+    private void DisposePendingIcons()
+    {
+        Bitmap? folderIcon = _pendingFolderIcon;
+        Dictionary<IntPtr, Bitmap>? icons = _pendingIcons;
+        List<IntPtr>? thumbnails = _pendingThumbnails;
+
+        _pendingFolderIcon = null;
+        _pendingIcons = null;
+        _pendingWindows = null;
+        _pendingThumbnails = null;
+
+        DisposeIconSet(folderIcon, icons);
+        ReleaseThumbnails(thumbnails);
+    }
+
     private static Bitmap GetFolderIcon()
     {
         string path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Glix");
@@ -426,6 +677,32 @@ internal sealed class ExplorerSwitcherForm : Form
         return bitmap;
     }
 
+    private static void ForceForeground(IntPtr handle)
+    {
+        IntPtr foreground = NativeMethods.GetForegroundWindow();
+        uint foregroundThread = NativeMethods.GetWindowThreadProcessId(foreground, out _);
+        uint currentThread = NativeMethods.GetCurrentThreadId();
+        bool attached = false;
+
+        if (foregroundThread != currentThread)
+        {
+            attached = NativeMethods.AttachThreadInput(currentThread, foregroundThread, true);
+        }
+
+        try
+        {
+            NativeMethods.BringWindowToTop(handle);
+            NativeMethods.SetForegroundWindow(handle);
+        }
+        finally
+        {
+            if (attached)
+            {
+                NativeMethods.AttachThreadInput(currentThread, foregroundThread, false);
+            }
+        }
+    }
+
     private void ActivateWindow(IntPtr handle)
     {
         if (!NativeMethods.IsWindow(handle))
@@ -438,8 +715,8 @@ internal sealed class ExplorerSwitcherForm : Form
             NativeMethods.ShowWindow(handle, NativeMethods.SW_RESTORE);
         }
 
-        HideAll();
-        NativeMethods.SetForegroundWindow(handle);
+        ForceForeground(handle);
+        HideAll(false);
     }
 
     private void CloseWindow(IntPtr handle)
@@ -674,6 +951,12 @@ internal sealed class ExplorerSwitcherForm : Form
 
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
     {
+        // Ctrl+Tab 由全局键盘钩子统一处理，避免与导航会话重复移动选中项。
+        if ((keyData & Keys.Control) != 0 && keyData == (Keys.Tab | Keys.Control))
+        {
+            return true;
+        }
+
         if (keyData == Keys.Tab || keyData == Keys.Right)
         {
             SelectTile(_selectedIndex + 1);
@@ -715,8 +998,33 @@ internal sealed class ExplorerSwitcherForm : Form
     /// <param name="disposing">是否释放托管资源。</param>
     protected override void Dispose(bool disposing)
     {
+        if (_disposed)
+        {
+            return;
+        }
+
         if (disposing)
         {
+            _disposed = true;
+            _loadCancellation.Cancel();
+            _loadTimer.Stop();
+
+            Thread? loadThread = _loadThread;
+
+            if (loadThread is not null && loadThread.IsAlive && !ReferenceEquals(loadThread, Thread.CurrentThread))
+            {
+                if (!loadThread.Join(TimeSpan.FromSeconds(2)))
+                {
+                    // 超时后不释放后台线程仍可能访问的资源，交由进程退出回收。
+                    base.Dispose(disposing);
+
+                    return;
+                }
+            }
+
+            _loadTimer.Dispose();
+            _loadCancellation.Dispose();
+            DisposePendingIcons();
             UnregisterThumbnails();
 
             foreach (Bitmap icon in _icons.Values)

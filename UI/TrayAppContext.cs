@@ -14,6 +14,7 @@ internal sealed class TrayAppContext : ApplicationContext
     #region 字段
 
     private readonly GestureEngine _engine;
+    private readonly KeyboardHook _keyboardHook = new KeyboardHook();
     private readonly NavigationAction _navigation;
     private readonly TrayDirectionIndicator _directionIcons = new TrayDirectionIndicator();
     private readonly Control _marshalControl = new Control();
@@ -32,6 +33,8 @@ internal sealed class TrayAppContext : ApplicationContext
     private List<ExplorerWindow>? _switcherWindows;
     private ExplorerSwitcherForm? _switcher;
     private volatile bool _switcherVisible;
+    private volatile bool _ctrlHeld;
+    private volatile bool _ctrlTabNavigating;
     private Icon? _currentTrayIcon;
     private float _lastAngle;
     private float _pendingAngle;
@@ -92,6 +95,10 @@ internal sealed class TrayAppContext : ApplicationContext
         _hotZones = new HotZoneManager(ShowSwitcher);
         _engine.SuppressInput = ShouldSuppressMouseInput;
 
+        _keyboardHook.KeyboardInputReceived += OnKeyboardInput;
+        _keyboardHook.SuppressInput = ShouldSuppressKeyboardInput;
+        _keyboardHook.Start();
+
         _distanceTracker = new MouseDistanceTracker();
         _engine.RawMouseMoved += _distanceTracker.OnMouseMove;
 
@@ -145,6 +152,8 @@ internal sealed class TrayAppContext : ApplicationContext
             _engine.MouseButtonDown -= OnMouseButtonDown;
             _engine.RawMouseMoved -= _distanceTracker.OnMouseMove;
             _engine.Dispose();
+            _keyboardHook.KeyboardInputReceived -= OnKeyboardInput;
+            _keyboardHook.Dispose();
             _distanceTracker.Dispose();
             _hotZones.Dispose();
             _distanceForm?.Close();
@@ -154,7 +163,6 @@ internal sealed class TrayAppContext : ApplicationContext
             if (_switcher is not null)
             {
                 _switcher.Hidden -= OnSwitcherHidden;
-                _switcher.Close();
                 _switcher.Dispose();
                 _switcher = null;
             }
@@ -219,6 +227,128 @@ internal sealed class TrayAppContext : ApplicationContext
         UpdateTrayIcon(angle);
 
         Volatile.Write(ref _angleUpdatePending, false);
+    }
+
+    private static bool IsCtrlKey(int virtualKey)
+    {
+        return virtualKey is NativeMethods.VK_CONTROL
+            or NativeMethods.VK_LCONTROL
+            or NativeMethods.VK_RCONTROL;
+    }
+
+    private static bool IsKeyDown(int message)
+    {
+        return message is NativeMethods.WM_KEYDOWN or NativeMethods.WM_SYSKEYDOWN;
+    }
+
+    private static bool IsExplorerForeground()
+    {
+        IntPtr foreground = NativeMethods.GetForegroundWindow();
+        IntPtr root = NativeMethods.GetAncestor(foreground, NativeMethods.GA_ROOT);
+        string rootClass = WindowInspector.GetClassName(root);
+
+        return rootClass is "CabinetWClass" or "ExplorerWClass";
+    }
+
+    private bool ShouldSuppressKeyboardInput(KeyboardInput input)
+    {
+        if (input.VirtualKey != NativeMethods.VK_TAB || !IsKeyDown(input.Message))
+        {
+            return false;
+        }
+
+        if (!_ctrlHeld)
+        {
+            return false;
+        }
+
+        return _ctrlTabNavigating || IsExplorerForeground();
+    }
+
+    private void OnKeyboardInput(KeyboardInput input)
+    {
+        if (IsCtrlKey(input.VirtualKey))
+        {
+            if (IsKeyDown(input.Message))
+            {
+                _ctrlHeld = true;
+
+                return;
+            }
+
+            if (input.Message is NativeMethods.WM_KEYUP or NativeMethods.WM_SYSKEYUP)
+            {
+                _ctrlHeld = false;
+                CommitCtrlTabNavigation();
+            }
+
+            return;
+        }
+
+        if (input.VirtualKey != NativeMethods.VK_TAB || !IsKeyDown(input.Message) || !_ctrlHeld)
+        {
+            return;
+        }
+
+        if (!_ctrlTabNavigating)
+        {
+            if (!IsExplorerForeground())
+            {
+                return;
+            }
+
+            _ctrlTabNavigating = true;
+        }
+
+        if (_marshalControl.IsHandleCreated)
+        {
+            _marshalControl.BeginInvoke(new Action(MoveNextInSwitcher));
+        }
+        else
+        {
+            MoveNextInSwitcher();
+        }
+    }
+
+    private void MoveNextInSwitcher()
+    {
+        if (!_switcherVisible)
+        {
+            ShowSwitcherCore(Rectangle.Empty);
+        }
+        else
+        {
+            _switcher?.MoveNext();
+        }
+    }
+
+    private void CommitCtrlTabNavigation()
+    {
+        if (!_ctrlTabNavigating)
+        {
+            return;
+        }
+
+        _ctrlTabNavigating = false;
+
+        if (_marshalControl.IsHandleCreated)
+        {
+            _marshalControl.BeginInvoke(new Action(ActivateSelectedInSwitcher));
+        }
+        else
+        {
+            ActivateSelectedInSwitcher();
+        }
+    }
+
+    private void ActivateSelectedInSwitcher()
+    {
+        if (!_switcherVisible || _switcher is null)
+        {
+            return;
+        }
+
+        _switcher.ActivateSelected();
     }
 
     private bool ShouldSuppressMouseInput(MouseInput input)

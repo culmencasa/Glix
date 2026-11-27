@@ -27,11 +27,14 @@ internal sealed class HotZoneManager : IDisposable
     private readonly object _placementSync = new object();
     private readonly System.Windows.Forms.Timer _timer = new System.Windows.Forms.Timer();
     private readonly Action<Rectangle> _onClick;
+    private readonly uint _appProcessId;
+    private IntPtr _activeHandle;
     private bool _disposed;
 
     public HotZoneManager(Action<Rectangle> onClick)
     {
         _onClick = onClick;
+        _appProcessId = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
 
         _timer.Interval = 30;
         _timer.Tick += OnTick;
@@ -41,6 +44,19 @@ internal sealed class HotZoneManager : IDisposable
     private void OnTick(object? sender, EventArgs e)
     {
         List<IntPtr> live = new List<IntPtr>();
+        IntPtr foreground = NativeMethods.GetForegroundWindow();
+        NativeMethods.GetWindowThreadProcessId(foreground, out uint foregroundPid);
+
+        if (foregroundPid == _appProcessId)
+        {
+            // 切换器或按钮自身获得焦点时，保留上次激活的资源管理器窗口。
+        }
+        else
+        {
+            IntPtr root = NativeMethods.GetAncestor(foreground, NativeMethods.GA_ROOT);
+            string rootClass = WindowInspector.GetClassName(root);
+            _activeHandle = rootClass is "CabinetWClass" or "ExplorerWClass" ? root : IntPtr.Zero;
+        }
 
         foreach (ExplorerWindow window in ExplorerWindowEnumerator.GetWindows())
         {
@@ -115,14 +131,24 @@ internal sealed class HotZoneManager : IDisposable
                 }
             }
 
-            if (!zone.Visible)
+            bool active = _activeHandle == window.Handle;
+
+            if (active && !zone.Visible)
             {
                 zone.Show();
             }
+            else if (!active && zone.Visible)
+            {
+                zone.Hide();
+            }
 
-            if (!pinZone.Visible)
+            if (active && !pinZone.Visible)
             {
                 pinZone.Show();
+            }
+            else if (!active && pinZone.Visible)
+            {
+                pinZone.Hide();
             }
 
             bool pinned = (NativeMethods.GetWindowLongPtr(window.Handle, NativeMethods.GWL_EXSTYLE).ToInt64()

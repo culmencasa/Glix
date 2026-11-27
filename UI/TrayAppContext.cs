@@ -1,5 +1,6 @@
 using System;
 using System.Drawing;
+using System.Net.NetworkInformation;
 using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -132,6 +133,7 @@ internal sealed class TrayAppContext : ApplicationContext
         };
 
         SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
+        NetworkChange.NetworkAddressChanged += OnNetworkAddressChanged;
         UpdateTrayText();
     }
 
@@ -148,6 +150,7 @@ internal sealed class TrayAppContext : ApplicationContext
         if (disposing)
         {
             SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
+            NetworkChange.NetworkAddressChanged -= OnNetworkAddressChanged;
             _engine.MouseAngleChanged -= OnMouseAngleChanged;
             _engine.MouseButtonDown -= OnMouseButtonDown;
             _engine.RawMouseMoved -= _distanceTracker.OnMouseMove;
@@ -546,9 +549,27 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private void UpdateTrayText()
     {
-        double total = _distanceTracker.ReadAll().Values.Sum();
         double today = _distanceTracker.TodayKm;
-        _notifyIcon.Text = $"Explorer 手势导航：顺时针后退 / 逆时针前进\n今日 {today:F2} 公里  累计 {total:F2} 公里";
+        string ip = LocalIpResolver.GetLocalIPv4();
+
+        if (string.IsNullOrEmpty(ip))
+        {
+            ip = "无网络";
+        }
+
+        _notifyIcon.Text = $"今日 {today:F2} 公里\n局域网IP: {ip}";
+    }
+
+    private void OnNetworkAddressChanged(object? sender, EventArgs e)
+    {
+        if (_marshalControl.IsHandleCreated)
+        {
+            _marshalControl.BeginInvoke(new Action(UpdateTrayText));
+        }
+        else
+        {
+            UpdateTrayText();
+        }
     }
 
     private void OnSleepTick(object? sender, EventArgs e)

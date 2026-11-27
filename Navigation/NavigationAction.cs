@@ -32,6 +32,14 @@ internal sealed class NavigationAction : IGestureAction, IDisposable
     }
 
     /// <summary>
+    /// 播放窗口切换的独立反馈音。
+    /// </summary>
+    public void PlaySwitchSound()
+    {
+        _sound.PlaySwitch();
+    }
+
+    /// <summary>
     /// 播放程序启动节奏音。
     /// </summary>
     public void PlayStartupSound()

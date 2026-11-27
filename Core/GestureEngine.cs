@@ -17,7 +17,9 @@ internal sealed class GestureEngine : IDisposable
     private readonly object _sync = new object();
     private readonly GestureOptions _options;
     private readonly List<IGestureTrigger> _triggers = new List<IGestureTrigger>();
+    private readonly List<ISelfGatedTrigger> _selfGatedTriggers = new List<ISelfGatedTrigger>();
     private readonly List<IGestureAction> _actions = new List<IGestureAction>();
+    private readonly List<GestureSignal> _pendingSignals = new List<GestureSignal>();
 
     private readonly MouseHook _hook = new MouseHook();
     private readonly ConcurrentQueue<MouseInput> _inputQueue = new ConcurrentQueue<MouseInput>();
@@ -33,7 +35,6 @@ internal sealed class GestureEngine : IDisposable
     private int _lastSampleX = int.MinValue;
     private int _lastSampleY = int.MinValue;
     private IntPtr _contextWindow = IntPtr.Zero;
-    private volatile bool _signalFired;
 
     // 鼠标主方向跟踪：用于驱动托盘图标的方向箭头指示，与手势识别相互独立。
     private int _lastDirX = int.MinValue;
@@ -97,6 +98,21 @@ internal sealed class GestureEngine : IDisposable
         }
     }
 
+    /// <summary>
+    /// 设置鼠标消息抑制回调，返回 true 的消息不会传递给目标窗口。
+    /// </summary>
+    public Func<MouseInput, bool>? SuppressInput
+    {
+        get
+        {
+            return _hook.SuppressInput;
+        }
+        set
+        {
+            _hook.SuppressInput = value;
+        }
+    }
+
     #endregion
 
     #region 事件
@@ -105,6 +121,16 @@ internal sealed class GestureEngine : IDisposable
     /// 鼠标主移动角度变化时触发，角度为从正上方顺时针计算的度数，用于驱动托盘图标的方向指示。
     /// </summary>
     public event Action<float>? MouseAngleChanged;
+
+    /// <summary>
+    /// 每一帧原始鼠标位移，独立于手势识别，供行程统计等旁路功能使用。
+    /// </summary>
+    public event Action<MouseInput>? RawMouseMoved;
+
+    /// <summary>
+    /// 鼠标按键按下时触发，供点击外部关闭浮层等旁路功能使用。
+    /// </summary>
+    public event Action<MouseInput>? MouseButtonDown;
 
     #endregion
 
@@ -119,6 +145,11 @@ internal sealed class GestureEngine : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         trigger.Signaled += OnSignaled;
         _triggers.Add(trigger);
+
+        if (trigger is ISelfGatedTrigger selfGated)
+        {
+            _selfGatedTriggers.Add(selfGated);
+        }
     }
 
     /// <summary>
@@ -195,7 +226,15 @@ internal sealed class GestureEngine : IDisposable
 
             while (_inputQueue.TryDequeue(out MouseInput input))
             {
-                ProcessInput(input);
+                try
+                {
+                    ProcessInput(input);
+                }
+                catch (Exception ex)
+                {
+                    // 单个输入的异常不能终止识别线程，否则后续鼠标事件将全部失效。
+                    System.Diagnostics.Debug.WriteLine(ex);
+                }
             }
         }
 
@@ -208,9 +247,16 @@ internal sealed class GestureEngine : IDisposable
     {
         if (IsButtonStateMessage(input.Message))
         {
+            bool down = IsButtonDownMessage(input.Message);
+
             lock (_sync)
             {
-                _buttonDown = IsButtonDownMessage(input.Message);
+                _buttonDown = down;
+            }
+
+            if (down)
+            {
+                MouseButtonDown?.Invoke(input);
             }
 
             ResetTrackers();
@@ -223,6 +269,8 @@ internal sealed class GestureEngine : IDisposable
         }
 
         long now = _stopwatch.ElapsedMilliseconds;
+        RawMouseMoved?.Invoke(input);
+        _pendingSignals.Clear();
 
         lock (_sync)
         {
@@ -233,57 +281,63 @@ internal sealed class GestureEngine : IDisposable
             }
         }
 
+        // 自门控触发源先接收原始位移，自行完成区域、冷却与中断判定。
+        foreach (ISelfGatedTrigger trigger in _selfGatedTriggers)
+        {
+            trigger.FeedRaw(input, now);
+        }
+
         // 抖动过滤：按欧氏距离判定，避免斜向微小位移因分轴判断而被误杀。
         double jitterX = input.X - (double)_lastSampleX;
         double jitterY = input.Y - (double)_lastSampleY;
         double jitterSquared = (jitterX * jitterX) + (jitterY * jitterY);
 
-        if (jitterSquared < _options.JitterPx * _options.JitterPx)
+        if (jitterSquared >= _options.JitterPx * _options.JitterPx)
         {
-            return;
-        }
+            _lastSampleX = input.X;
+            _lastSampleY = input.Y;
 
-        _lastSampleX = input.X;
-        _lastSampleY = input.Y;
+            // 方向指示：跟踪鼠标主移动方向，变化时通知外部更新托盘图标。
+            UpdateDirection(input.X, input.Y);
 
-        // 方向指示：跟踪鼠标主移动方向，变化时通知外部更新托盘图标。
-        UpdateDirection(input.X, input.Y);
-
-        if (!ExplorerListHitTester.IsOverFileList(input.X, input.Y, out IntPtr explorerWindow))
-        {
-            long outsideMs = now - _lastInsideListMs;
-
-            // 窗口切换、目录加载期间区域判定会瞬时断开，短暂离开不应丢弃正在进行的轨迹。
-            if (outsideMs > _options.OffListGraceMs)
+            if (!ExplorerListHitTester.IsOverFileList(input.X, input.Y, out IntPtr explorerWindow))
             {
-                ResetTrackers();
+                long outsideMs = now - _lastInsideListMs;
+
+                // 窗口切换、目录加载期间区域判定会瞬时断开，短暂离开不应丢弃正在进行的轨迹。
+                if (outsideMs > _options.OffListGraceMs)
+                {
+                    ResetTrackers();
+                }
+
+                _contextWindow = IntPtr.Zero;
             }
-
-            _contextWindow = IntPtr.Zero;
-            return;
-        }
-
-        _lastInsideListMs = now;
-        _contextWindow = explorerWindow;
-
-        // 硬屏蔽期：上次手势后短时间内完全忽略鼠标位移，杜绝尾段/手抖被当成另一次手势。
-        if (now - Volatile.Read(ref _lastGestureMs) < _options.GestureSuppressionMs)
-        {
-            ResetTrackers();
-            return;
-        }
-
-        _signalFired = false;
-
-        foreach (IGestureTrigger trigger in _triggers)
-        {
-            trigger.Feed(input, now);
-
-            if (_signalFired)
+            else
             {
-                return;
+                _lastInsideListMs = now;
+                _contextWindow = explorerWindow;
+
+                // 硬屏蔽期：上次手势后短时间内完全忽略鼠标位移，杜绝尾段/手抖被当成另一次手势。
+                if (now - Volatile.Read(ref _lastGestureMs) < _options.GestureSuppressionMs)
+                {
+                    ResetTrackers();
+                }
+                else
+                {
+                    foreach (IGestureTrigger trigger in _triggers)
+                    {
+                        if (trigger is ISelfGatedTrigger)
+                        {
+                            continue;
+                        }
+
+                        trigger.Feed(input, now);
+                    }
+                }
             }
         }
+
+        DispatchBestSignal();
     }
 
     private void UpdateDirection(int x, int y)
@@ -321,10 +375,35 @@ internal sealed class GestureEngine : IDisposable
 
     private void OnSignaled(GestureSignal signal)
     {
-        // 命中即斩断：立即写入硬屏蔽时间戳，旧轨迹已被识别器清空，绝不允许污染下一个手势。
-        _signalFired = true;
-        GestureSignal dispatched = signal with { ContextWindow = _contextWindow };
-        Volatile.Write(ref _lastGestureMs, signal.TimestampMs);
+        // 只收集候选；同一次移动里所有识别器都完成后再按置信度裁决。
+        _pendingSignals.Add(signal);
+    }
+
+    private void DispatchBestSignal()
+    {
+        if (_pendingSignals.Count == 0)
+        {
+            return;
+        }
+
+        GestureSignal best = _pendingSignals[0];
+
+        for (int index = 1; index < _pendingSignals.Count; index++)
+        {
+            if (_pendingSignals[index].Confidence > best.Confidence)
+            {
+                best = _pendingSignals[index];
+            }
+        }
+
+        _pendingSignals.Clear();
+
+        // 命中即斩断：立即写入硬屏蔽时间戳并清空全部识别器状态，杜绝一次手势被重复触发。
+        GestureSignal dispatched = best with
+        {
+            ContextWindow = best.ContextWindow != IntPtr.Zero ? best.ContextWindow : _contextWindow
+        };
+        Volatile.Write(ref _lastGestureMs, best.TimestampMs);
         ResetTrackers();
 
         foreach (IGestureAction action in _actions)

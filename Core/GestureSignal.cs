@@ -20,7 +20,12 @@ internal enum GestureSignalKind
     /// <summary>
     /// 逆时针画圈（屏幕坐标系）。
     /// </summary>
-    CircleCounterClockwise
+    CircleCounterClockwise,
+
+    /// <summary>
+    /// 资源管理器文件视图内的横向往返 glick，请求打开窗口切换器。
+    /// </summary>
+    TGlick
 }
 
 /// <summary>
@@ -31,9 +36,11 @@ internal enum GestureSignalKind
 /// <param name="Y">信号产生时的屏幕坐标 Y。</param>
 /// <param name="TimestampMs">信号时间戳（毫秒）。</param>
 /// <param name="ContextWindow">信号产生时可用的上下文窗口句柄，例如当前资源管理器顶层窗口。</param>
+/// <param name="Confidence">识别置信度；同一次移动中多个触发源同时命中时取置信度最高者。</param>
 internal readonly record struct GestureSignal(
     GestureSignalKind Kind,
     int X,
     int Y,
     long TimestampMs,
-    IntPtr ContextWindow);
+    IntPtr ContextWindow,
+    double Confidence = 0d);

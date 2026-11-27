@@ -44,6 +44,9 @@ internal sealed class SoundFeedback : IDisposable
     private static readonly BeepNote BackwardNote = new BeepNote(523, 100);
     private static readonly BeepNote ForwardNote = new BeepNote(784, 100);
 
+    // 窗口切换反馈音：与前进/后退音调明显区分的独立高音。
+    private static readonly BeepNote SwitchNote = new BeepNote(1047, 130);
+
     // 启动节奏音：经典游戏机上行的方波音阶，短音渐高后以稍长音收尾。
     private static readonly BeepNote[] StartupNotes =
     {
@@ -208,6 +211,19 @@ internal sealed class SoundFeedback : IDisposable
         }
 
         Enqueue(ForwardNote);
+    }
+
+    /// <summary>
+    /// 播放窗口切换反馈音（独立高音，区别于前进/后退音调）。
+    /// </summary>
+    public void PlaySwitch()
+    {
+        if (!Enabled)
+        {
+            return;
+        }
+
+        Enqueue(SwitchNote);
     }
 
     /// <summary>

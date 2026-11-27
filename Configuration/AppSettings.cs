@@ -21,6 +21,56 @@ internal sealed class AppSettings
     /// </summary>
     public int MinTurnDegrees { get; set; } = 240;
 
+    /// <summary>
+    /// 是否启用横向 glick 窗口切换（默认关闭）。
+    /// </summary>
+    public bool TGlickEnabled { get; set; }
+
+    /// <summary>
+    /// 横向 glick 触发所需的有效折返次数。
+    /// </summary>
+    public int TGlickRequiredReversals { get; set; } = 3;
+
+    /// <summary>
+    /// 横向 glick 第一程最小位移（像素）。
+    /// </summary>
+    public int TGlickFirstLegPx { get; set; } = 60;
+
+    /// <summary>
+    /// 横向 glick 后续每程最小位移（像素）。
+    /// </summary>
+    public int TGlickReturnLegPx { get; set; } = 50;
+
+    /// <summary>
+    /// 横向 glick 全程纵向最大偏移（像素）。
+    /// </summary>
+    public int TGlickMaxVerticalPx { get; set; } = 30;
+
+    /// <summary>
+    /// 横向 glick 最小峰值速度（像素/秒）。
+    /// </summary>
+    public int TGlickMinPeakSpeed { get; set; } = 1000;
+
+    /// <summary>
+    /// 横向 glick 最大时长（毫秒）。
+    /// </summary>
+    public int TGlickMaxDurationMs { get; set; } = 320;
+
+    /// <summary>
+    /// 横向 glick 触发后的冷却时长（毫秒）。
+    /// </summary>
+    public int TGlickCooldownMs { get; set; } = 700;
+
+    /// <summary>
+    /// 横向 glick 抖动死区（像素）。
+    /// </summary>
+    public int TGlickJitterPx { get; set; } = 4;
+
+    /// <summary>
+    /// 是否输出横向 glick 调试日志。
+    /// </summary>
+    public bool TGlickDebugLog { get; set; }
+
     private static readonly string FilePath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "Glix",

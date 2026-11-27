@@ -25,3 +25,19 @@ internal interface IGestureTrigger : IDisposable
     /// </summary>
     void Reset();
 }
+
+/// <summary>
+/// 自门控触发源：直接接收未经区域、抖动与硬屏蔽过滤的原始位移，由自身负责上下文判定与中断清理。
+/// </summary>
+/// <remarks>
+/// 供需要独立区域规则与冷却的手势接入，避免改动既有旋转手势的编排逻辑；移除该接口实现即可整体撤掉对应功能。
+/// </remarks>
+internal interface ISelfGatedTrigger : IGestureTrigger
+{
+    /// <summary>
+    /// 接收每一帧原始鼠标位移。
+    /// </summary>
+    /// <param name="input">鼠标输入事件。</param>
+    /// <param name="timestampMs">时间戳（毫秒）。</param>
+    void FeedRaw(MouseInput input, long timestampMs);
+}

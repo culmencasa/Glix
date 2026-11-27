@@ -57,7 +57,7 @@ internal sealed class CircleGestureTrigger : IGestureTrigger
             ? GestureSignalKind.CircleClockwise
             : GestureSignalKind.CircleCounterClockwise;
 
-        Signaled?.Invoke(new GestureSignal(kind, input.X, input.Y, timestampMs, IntPtr.Zero));
+        Signaled?.Invoke(new GestureSignal(kind, input.X, input.Y, timestampMs, IntPtr.Zero, 1d));
     }
 
     /// <inheritdoc/>

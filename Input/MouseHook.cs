@@ -41,6 +41,15 @@ internal sealed class MouseHook : IDisposable
 
     #endregion
 
+    #region 属性
+
+    /// <summary>
+    /// 返回 true 时阻止该鼠标消息继续传递给目标窗口，用于屏蔽热区按钮区域的标题栏双击。
+    /// </summary>
+    public Func<MouseInput, bool>? SuppressInput { get; set; }
+
+    #endregion
+
     #region 构造函数
 
     public MouseHook()
@@ -167,6 +176,11 @@ internal sealed class MouseHook : IDisposable
             {
                 MouseInput input = new MouseInput(message, info.Pt.X, info.Pt.Y);
                 MouseInputReceived.Invoke(input);
+
+                if (SuppressInput?.Invoke(input) == true)
+                {
+                    return new IntPtr(1);
+                }
             }
         }
 

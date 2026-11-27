@@ -1,4 +1,5 @@
 using System;
+using System.Drawing;
 using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -21,13 +22,22 @@ internal sealed class TrayAppContext : ApplicationContext
     private readonly ToolStripMenuItem _soundItem;
     private readonly ToolStripMenuItem _soundSourceItem;
     private readonly ToolStripMenuItem _settingsItem;
+    private readonly ToolStripMenuItem _distanceItem;
     private readonly AppSettings _settings;
     private readonly GestureOptions _gestureOptions;
+    private readonly TGlickOptions _tglickOptions;
+    private readonly MouseDistanceTracker _distanceTracker;
+    private readonly HotZoneManager _hotZones;
+    private MouseDistanceForm? _distanceForm;
+    private List<ExplorerWindow>? _switcherWindows;
+    private ExplorerSwitcherForm? _switcher;
+    private volatile bool _switcherVisible;
     private Icon? _currentTrayIcon;
     private float _lastAngle;
     private float _pendingAngle;
     private bool _angleUpdatePending;
     private readonly System.Windows.Forms.Timer _sleepTimer = new System.Windows.Forms.Timer();
+    private readonly System.Windows.Forms.Timer _trayInfoTimer = new System.Windows.Forms.Timer();
     private int _sleepFrame;
 
     #endregion
@@ -54,14 +64,43 @@ internal sealed class TrayAppContext : ApplicationContext
             MinTurnDegrees = _settings.MinTurnDegrees
         };
 
+        _tglickOptions = new TGlickOptions
+        {
+            Enabled = _settings.TGlickEnabled,
+            RequiredReversals = _settings.TGlickRequiredReversals,
+            FirstLegMinPx = _settings.TGlickFirstLegPx,
+            ReturnLegMinPx = _settings.TGlickReturnLegPx,
+            MaxVerticalOffsetPx = _settings.TGlickMaxVerticalPx,
+            MinPeakSpeedPxPerSecond = _settings.TGlickMinPeakSpeed,
+            MaxDurationMs = _settings.TGlickMaxDurationMs,
+            CooldownMs = _settings.TGlickCooldownMs,
+            JitterDeadZonePx = _settings.TGlickJitterPx,
+            DebugLogging = _settings.TGlickDebugLog
+        };
+
         _engine = new GestureEngine(_gestureOptions);
         _engine.AddTrigger(new CircleGestureTrigger(_gestureOptions));
         _engine.AddAction(_navigation);
+        _engine.AddAction(new ExplorerSwitcherAction(
+            _navigation.PlaySwitchSound,
+            () => ShowSwitcher(Rectangle.Empty),
+            () => _switcherVisible));
         _engine.MouseAngleChanged += OnMouseAngleChanged;
+        _engine.MouseButtonDown += OnMouseButtonDown;
         _engine.Start();
+
+        _hotZones = new HotZoneManager(ShowSwitcher);
+        _engine.SuppressInput = ShouldSuppressMouseInput;
+
+        _distanceTracker = new MouseDistanceTracker();
+        _engine.RawMouseMoved += _distanceTracker.OnMouseMove;
 
         _sleepTimer.Interval = 600;
         _sleepTimer.Tick += OnSleepTick;
+
+        _trayInfoTimer.Interval = 10000;
+        _trayInfoTimer.Tick += OnTrayInfoTick;
+        _trayInfoTimer.Start();
 
         _currentTrayIcon = _directionIcons.CreateIcon(0f);
 
@@ -69,11 +108,13 @@ internal sealed class TrayAppContext : ApplicationContext
         _soundItem = new ToolStripMenuItem("提示音") { CheckOnClick = true, Checked = true };
         _soundSourceItem = new ToolStripMenuItem("使用系统导航音效") { CheckOnClick = true, Checked = false };
         _settingsItem = new ToolStripMenuItem("设置...");
+        _distanceItem = new ToolStripMenuItem("鼠标行程统计...");
 
         _pauseItem.Click += OnPauseClicked;
         _soundItem.Click += OnSoundClicked;
         _soundSourceItem.Click += OnSoundSourceClicked;
         _settingsItem.Click += OnSettingsClicked;
+        _distanceItem.Click += OnDistanceClicked;
 
         _notifyIcon = new NotifyIcon
         {
@@ -84,6 +125,7 @@ internal sealed class TrayAppContext : ApplicationContext
         };
 
         SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
+        UpdateTrayText();
     }
 
     #endregion
@@ -100,8 +142,24 @@ internal sealed class TrayAppContext : ApplicationContext
         {
             SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
             _engine.MouseAngleChanged -= OnMouseAngleChanged;
+            _engine.MouseButtonDown -= OnMouseButtonDown;
+            _engine.RawMouseMoved -= _distanceTracker.OnMouseMove;
             _engine.Dispose();
+            _distanceTracker.Dispose();
+            _hotZones.Dispose();
+            _distanceForm?.Close();
+            _distanceForm?.Dispose();
+            _distanceForm = null;
+            _switcherVisible = false;
+            if (_switcher is not null)
+            {
+                _switcher.Hidden -= OnSwitcherHidden;
+                _switcher.Close();
+                _switcher.Dispose();
+                _switcher = null;
+            }
             _sleepTimer.Dispose();
+            _trayInfoTimer.Dispose();
             _currentTrayIcon?.Dispose();
             _directionIcons.Dispose();
             _marshalControl.Dispose();
@@ -126,6 +184,7 @@ internal sealed class TrayAppContext : ApplicationContext
         menu.Items.Add(_soundItem);
         menu.Items.Add(_soundSourceItem);
         menu.Items.Add(_settingsItem);
+        menu.Items.Add(_distanceItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(exitItem);
 
@@ -160,6 +219,141 @@ internal sealed class TrayAppContext : ApplicationContext
         UpdateTrayIcon(angle);
 
         Volatile.Write(ref _angleUpdatePending, false);
+    }
+
+    private bool ShouldSuppressMouseInput(MouseInput input)
+    {
+        if (input.Message != NativeMethods.WM_LBUTTONDOWN && input.Message != NativeMethods.WM_LBUTTONUP)
+        {
+            return false;
+        }
+
+        return _hotZones.TryHit(new Point(input.X, input.Y), out _);
+    }
+
+    private static void ToggleTopMost(IntPtr handle)
+    {
+        if (!NativeMethods.IsWindow(handle))
+        {
+            return;
+        }
+
+        IntPtr exStyle = NativeMethods.GetWindowLongPtr(handle, NativeMethods.GWL_EXSTYLE);
+        bool pinned = (exStyle.ToInt64() & NativeMethods.WS_EX_TOPMOST) != 0;
+        NativeMethods.SetWindowPos(handle,
+            pinned ? NativeMethods.HWND_NOTOPMOST : NativeMethods.HWND_TOPMOST,
+            0, 0, 0, 0,
+            NativeMethods.SWP_NOMOVE | NativeMethods.SWP_NOSIZE | NativeMethods.SWP_NOACTIVATE);
+    }
+
+    private void OnMouseButtonDown(MouseInput input)
+    {
+        Point point = new Point(input.X, input.Y);
+
+        if (_hotZones.TryHit(point, out HotZoneHit hit))
+        {
+            if (hit.Kind == HotZoneKind.Switcher)
+            {
+                ShowSwitcher(hit.Placement);
+            }
+            else
+            {
+                ToggleTopMost(hit.WindowHandle);
+            }
+
+            return;
+        }
+
+        if (!_switcherVisible || _switcher is null)
+        {
+            return;
+        }
+
+        if (_switcher.ContainsScreenPoint(point))
+        {
+            return;
+        }
+
+        if (_marshalControl.IsHandleCreated)
+        {
+            _marshalControl.BeginInvoke(new Action(HideSwitcherCore));
+        }
+        else
+        {
+            HideSwitcherCore();
+        }
+    }
+
+    private void HideSwitcherCore()
+    {
+        if (_switcherVisible)
+        {
+            _switcher?.HideAll();
+        }
+    }
+
+    private void ShowSwitcher(Rectangle anchor)
+    {
+        if (_switcherVisible)
+        {
+            HideSwitcher();
+
+            return;
+        }
+
+        if (_marshalControl.IsHandleCreated)
+        {
+            _marshalControl.BeginInvoke(new Action<Rectangle>(ShowSwitcherCore), anchor);
+        }
+        else
+        {
+            ShowSwitcherCore(anchor);
+        }
+    }
+
+    private void HideSwitcher()
+    {
+        if (_marshalControl.IsHandleCreated)
+        {
+            _marshalControl.BeginInvoke(new Action(HideSwitcherCore));
+        }
+        else
+        {
+            HideSwitcherCore();
+        }
+    }
+
+    private void ShowSwitcherCore(Rectangle anchor)
+    {
+        if (_switcherVisible)
+        {
+            return;
+        }
+
+        _switcherWindows = new List<ExplorerWindow>(ExplorerWindowEnumerator.GetWindows());
+
+        if (_switcherWindows.Count == 0)
+        {
+            return;
+        }
+
+        if (_switcher is null)
+        {
+            _switcher = new ExplorerSwitcherForm(_switcherWindows);
+            _switcher.Hidden += OnSwitcherHidden;
+        }
+        else
+        {
+            _switcher.Update(_switcherWindows);
+        }
+
+        _switcher.Present(anchor);
+        _switcherVisible = true;
+    }
+
+    private void OnSwitcherHidden()
+    {
+        _switcherVisible = false;
     }
 
     private void OnUserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
@@ -215,6 +409,18 @@ internal sealed class TrayAppContext : ApplicationContext
         }
     }
 
+    private void OnTrayInfoTick(object? sender, EventArgs e)
+    {
+        UpdateTrayText();
+    }
+
+    private void UpdateTrayText()
+    {
+        double total = _distanceTracker.ReadAll().Values.Sum();
+        double today = _distanceTracker.TodayKm;
+        _notifyIcon.Text = $"Explorer 手势导航：顺时针后退 / 逆时针前进\n今日 {today:F2} 公里  累计 {total:F2} 公里";
+    }
+
     private void OnSleepTick(object? sender, EventArgs e)
     {
         _sleepFrame = (_sleepFrame + 1) % 3;
@@ -243,8 +449,15 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private void OnSettingsClicked(object? sender, EventArgs e)
     {
-        using var form = new SettingsForm(_settings, _gestureOptions);
+        using var form = new SettingsForm(_settings, _gestureOptions, _tglickOptions);
         form.ShowDialog();
+    }
+
+    private void OnDistanceClicked(object? sender, EventArgs e)
+    {
+        _distanceForm?.Close();
+        _distanceForm = new MouseDistanceForm(_distanceTracker);
+        _distanceForm.Show();
     }
 
     private void OnExitClicked(object? sender, EventArgs e)

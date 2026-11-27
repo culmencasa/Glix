@@ -9,13 +9,21 @@
     <LangVersion>latest</LangVersion>
     <RootNamespace>Glix</RootNamespace>
     <AssemblyName>Glix</AssemblyName>
+    <Version>1.0.1</Version>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <ApplicationIcon>Resources\glix.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="Silk.NET.SDL" Version="2.23.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="Resources\glix.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 
 </Project>
